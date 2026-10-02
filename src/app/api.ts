@@ -3,12 +3,22 @@ import type { BaseQueryFn } from '@reduxjs/toolkit/query/react'
 import type {
   MaterialFile,
   MaterialPackage,
+  PackageVersion,
   PageReview,
   ReviewComment,
   WorkspaceState,
 } from '@/types/domain'
-import { loadWorkspace, resetWorkspace, saveWorkspace } from '@/services/storage'
+import { loadWorkspace, resetWorkspace, saveWorkspace, saveWorkspaceAtomic } from '@/services/storage'
 import { createApprovalRoute, findApplicableRule, validatePackage } from '@/services/rules'
+import {
+  buildBatch,
+  currentBatch,
+  freezeFileVersion,
+  invalidateForFileReversion,
+  receiptMismatches,
+  refreshBatchStatus,
+  releaseBlockers,
+} from '@/services/recon'
 
 type MockRequest = {
   url: string
@@ -125,6 +135,7 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
       }
       file.versions.push(newVersion)
       file.activeVersionId = newVersion.id
+      const outcome = invalidateForFileReversion(state, file, newVersion.id)
       audit({
         packageId,
         action: '上传文件版本',
@@ -132,6 +143,15 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
         operator: '当前用户',
         detail: summary,
       })
+      if (outcome.invalidatedSteps || outcome.invalidatedReceipts || outcome.recalculatedBatches.length) {
+        audit({
+          packageId,
+          action: '换版失效重算',
+          target: file.name,
+          operator: '当前用户',
+          detail: `待审批步骤失效重算 ${outcome.invalidatedSteps} 项，未核回执失效 ${outcome.invalidatedReceipts} 张，批次重算：${outcome.recalculatedBatches.join('、') || '无'}；已确认意见与许可记录保留。`,
+        })
+      }
     } else if (url === '/file/reference') {
       const fileId = String(payload.fileId)
       const versionId = String(payload.versionId)
@@ -219,12 +239,38 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
       packageItem.matchedRuleId = rule.id
       packageItem.status = 'reviewing'
       packageItem.currentRound += 1
+      // 送审固化：资料包版本快照 + 对账批次（文件引用版本与逐页脱敏摘要）
+      const submitVersion: PackageVersion = {
+        id: `package-version-${crypto.randomUUID()}`,
+        label: `送审-R${packageItem.currentRound}`,
+        createdAt: now(),
+        createdBy: '当前用户',
+        summary: `第 ${packageItem.currentRound} 轮送审固化快照，对账批次以此为准。`,
+        snapshot: {
+          title: packageItem.title,
+          category: packageItem.category,
+          destination: packageItem.destination,
+          endUse: packageItem.endUse,
+          technologyTags: [...packageItem.technologyTags],
+          personnelScopes: [...packageItem.personnelScopes],
+          declarations: [...packageItem.declarations],
+          activeFileVersions: Object.fromEntries(
+            state.files
+              .filter((file) => file.packageId === packageId)
+              .map((file) => [file.id, file.referencedVersionId]),
+          ),
+        },
+      }
+      packageItem.versions.push(submitVersion)
+      const batch = buildBatch(packageItem, state.files, submitVersion.id, '当前用户')
+      state.batches.push(batch)
+      refreshBatchStatus(state, packageId)
       audit({
         packageId,
         action: '提交审批',
         target: packageItem.code,
         operator: '当前用户',
-        detail: `按 ${rule.name} 生成审批路线，第 ${packageItem.currentRound} 轮。`,
+        detail: `按 ${rule.name} 生成审批路线，第 ${packageItem.currentRound} 轮；送审固化对账批次 ${batch.code}，逐页脱敏摘要${batch.digestComplete ? '已补齐' : '未补齐'}。`,
       })
     } else if (url === '/approval/decide') {
       const packageId = String(payload.packageId)
@@ -240,10 +286,13 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
         packageItem.status = 'returned'
       } else {
         step.status = 'approved'
-        const next = packageItem.approvalRoute.find((item) => item.order === step.order + 1)
+        const next = packageItem.approvalRoute.find(
+          (item) => item.order === step.order + 1 && item.status === 'waiting',
+        )
         if (next) next.status = 'active'
         else packageItem.status = 'approved'
       }
+      refreshBatchStatus(state, packageId)
       audit({
         packageId,
         action: decision === 'return' ? '审批退回' : '审批通过',
@@ -256,6 +305,10 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
       const amount = Number(payload.amount)
       const packageItem = state.packages.find((item) => item.id === packageId)
       if (!packageItem) throw new Error('资料包不存在')
+      const batch = currentBatch(state, packageId)
+      if (batch && batch.status !== 'released') {
+        throw new Error(`对账批次 ${batch.code} 未放行，不能扣减许可额度。`)
+      }
       if (packageItem.quotaUsed + amount > packageItem.quotaLimit) {
         throw new Error('许可额度不足')
       }
@@ -268,6 +321,144 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
         operator: '当前用户',
         detail: `扣减 ${amount}，剩余 ${packageItem.quotaLimit - packageItem.quotaUsed}。`,
       })
+    } else if (url === '/receipt/ingest') {
+      const batchId = String(payload.batchId)
+      const batch = state.batches.find((item) => item.id === batchId)
+      if (!batch) throw new Error('对账批次不存在')
+      const receiptNo = String(payload.receiptNo ?? '').trim()
+      if (!receiptNo) throw new Error('回执号不能为空')
+      const duplicate = state.receipts.find((item) => item.receiptNo === receiptNo)
+      if (duplicate) {
+        audit({
+          packageId: batch.packageId,
+          action: '重复回执已忽略',
+          target: `${batch.code} / ${receiptNo}`,
+          operator: '许可平台',
+          detail: '同一回执号只入账一次，本次重复推送未产生新记录。',
+        })
+        saveWorkspace(state)
+        return { data: state }
+      }
+      const claim = {
+        packageVersionId: String(payload.packageVersionId ?? ''),
+        fileVersions: (payload.fileVersions ?? {}) as Record<string, string>,
+      }
+      const mismatches = receiptMismatches(batch, claim)
+      let status: 'pending' | 'verified' | 'invalid'
+      let invalidReason: string | undefined
+      let verifiedAt: string | undefined
+      if (batch.status === 'released') {
+        status = 'invalid'
+        invalidReason = '批次已放行，迟到回执仅登记，不参与对账。'
+      } else if (mismatches.length) {
+        status = 'pending'
+      } else {
+        status = 'verified'
+        verifiedAt = now()
+      }
+      state.receipts.unshift({
+        id: `receipt-${crypto.randomUUID()}`,
+        batchId: batch.id,
+        packageId: batch.packageId,
+        receiptNo,
+        packageVersionId: claim.packageVersionId,
+        fileVersions: claim.fileVersions,
+        status,
+        note: String(payload.note ?? ''),
+        receivedAt: now(),
+        verifiedAt,
+        invalidReason,
+      })
+      refreshBatchStatus(state, batch.packageId)
+      audit({
+        packageId: batch.packageId,
+        action: status === 'verified' ? '回执入账已核' : status === 'pending' ? '回执入账待核' : '迟到回执登记',
+        target: `${batch.code} / ${receiptNo}`,
+        operator: '许可平台',
+        detail:
+          status === 'verified'
+            ? '回执版本与批次固化版本一致，已核销。'
+            : status === 'pending'
+              ? `版本对不上，停在待核：${mismatches.join('；')}。`
+              : (invalidReason ?? ''),
+      })
+    } else if (url === '/receipt/void') {
+      const receipt = state.receipts.find((item) => item.id === String(payload.receiptId))
+      if (!receipt) throw new Error('回执不存在')
+      if (receipt.status !== 'pending') throw new Error('只有待核回执可以作废')
+      receipt.status = 'invalid'
+      receipt.invalidReason = String(payload.reason ?? '人工核销作废')
+      refreshBatchStatus(state, receipt.packageId)
+      audit({
+        packageId: receipt.packageId,
+        action: '作废待核回执',
+        target: receipt.receiptNo,
+        operator: '当前用户',
+        detail: receipt.invalidReason,
+      })
+    } else if (url === '/batch/sync-digests') {
+      const batchId = String(payload.batchId)
+      const batch = state.batches.find((item) => item.id === batchId)
+      if (!batch) throw new Error('对账批次不存在')
+      if (batch.status === 'released') throw new Error('批次已放行，不能重算摘要')
+      // 按批次固化的版本重新汇总逐页脱敏摘要；核对记录仍缺失则保持不完整，补不全不放行。
+      batch.files = batch.files.map((entry) => {
+        const file = state.files.find((item) => item.id === entry.fileId)
+        if (!file) {
+          return {
+            ...entry,
+            pages: [],
+            missing: ['文件已不存在，无法回填脱敏摘要。'],
+            complete: false,
+          }
+        }
+        return freezeFileVersion(file, entry.versionId)
+      })
+      batch.digestComplete = batch.files.every((entry) => entry.complete)
+      batch.revision += 1
+      refreshBatchStatus(state, batch.packageId)
+      audit({
+        packageId: batch.packageId,
+        action: '重算批次摘要',
+        target: batch.code,
+        operator: '当前用户',
+        detail: `按固化版本重新汇总逐页脱敏摘要：${batch.digestComplete ? '已补齐' : '仍有缺失，不放行'}。`,
+      })
+    } else if (url === '/batch/release') {
+      const batchId = String(payload.batchId)
+      const expectedRevision = Number(payload.expectedRevision)
+      const operator = String(payload.operator ?? '当前用户')
+      const batch = state.batches.find((item) => item.id === batchId)
+      if (!batch) throw new Error('对账批次不存在')
+      const packageItem = state.packages.find((item) => item.id === batch.packageId)
+      if (!packageItem) throw new Error('资料包不存在')
+      if (batch.status === 'released') throw new Error('该批次已放行，重复确认已被拦截。')
+      if (batch.revision !== expectedRevision) {
+        throw new Error('批次已被他人更新，请刷新后按最新批次重试。')
+      }
+      const blockers = releaseBlockers(batch, state.receipts, packageItem)
+      if (blockers.length) throw new Error(`不满足放行条件：${blockers.join('；')}`)
+      if (payload.simulateFailure) {
+        throw new Error('模拟写入失败：未写入任何数据，可从完整批次重试。')
+      }
+      batch.status = 'released'
+      batch.releasedAt = now()
+      batch.releasedBy = operator
+      batch.revision += 1
+      audit({
+        packageId: batch.packageId,
+        action: '批次放行',
+        target: batch.code,
+        operator,
+        detail: `第 ${batch.round} 轮对账完成并放行，许可记录生效；本操作为完整批次原子写入。`,
+      })
+      saveWorkspaceAtomic(state, (stored) => {
+        const storedBatch = stored.batches.find((item) => item.id === batchId)
+        return Boolean(
+          storedBatch && storedBatch.status !== 'released' && storedBatch.revision === expectedRevision,
+        )
+      })
+      return { data: state }
     } else if (url === '/comment/add') {
       state.comments.unshift({
         ...(payload.comment as Omit<ReviewComment, 'id' | 'createdAt'>),
@@ -286,10 +477,16 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
     saveWorkspace(state)
     return { data: state }
   } catch (error) {
+    const message =
+      error instanceof Error && error.message === 'CONCURRENT_MODIFICATION'
+        ? '写入冲突：该批次已被他人放行或更新，重复确认只放行一个，请刷新后查看。'
+        : error instanceof Error
+          ? error.message
+          : '本地操作失败'
     return {
       error: {
         status: 400,
-        error: error instanceof Error ? error.message : '本地操作失败',
+        error: message,
       },
     }
   }
@@ -374,6 +571,34 @@ export const workspaceApi = createApi({
       query: (body) => ({ url: '/license/deduct', method: 'POST', body }),
       invalidatesTags: ['Workspace'],
     }),
+    ingestReceipt: builder.mutation<
+      WorkspaceState,
+      {
+        batchId: string
+        receiptNo: string
+        packageVersionId: string
+        fileVersions: Record<string, string>
+        note?: string
+      }
+    >({
+      query: (body) => ({ url: '/receipt/ingest', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    voidReceipt: builder.mutation<WorkspaceState, { receiptId: string; reason: string }>({
+      query: (body) => ({ url: '/receipt/void', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    syncBatchDigests: builder.mutation<WorkspaceState, { batchId: string }>({
+      query: (body) => ({ url: '/batch/sync-digests', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    releaseBatch: builder.mutation<
+      WorkspaceState,
+      { batchId: string; expectedRevision: number; operator: string; simulateFailure?: boolean }
+    >({
+      query: (body) => ({ url: '/batch/release', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
     addComment: builder.mutation<
       WorkspaceState,
       { comment: Omit<ReviewComment, 'id' | 'createdAt'> }
@@ -408,6 +633,10 @@ export const {
   useSubmitApprovalMutation,
   useDecideApprovalMutation,
   useDeductQuotaMutation,
+  useIngestReceiptMutation,
+  useVoidReceiptMutation,
+  useSyncBatchDigestsMutation,
+  useReleaseBatchMutation,
   useAddCommentMutation,
   useAddAuditMutation,
   useResetWorkspaceMutation,

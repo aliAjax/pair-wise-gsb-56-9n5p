@@ -22,6 +22,7 @@ import {
 } from '@/app/api'
 import type { LicenseRule } from '@/types/domain'
 import { approvalLevelLabels, findApplicableRule } from '@/services/rules'
+import { batchStatusColors, batchStatusLabels, currentBatch } from '@/services/recon'
 
 export function LicensePage() {
   const [searchParams] = useSearchParams()
@@ -46,6 +47,9 @@ export function LicensePage() {
   const remaining = selected ? selected.quotaLimit - selected.quotaUsed : 0
 
   if (isLoading || !data) return <div className="panel">正在加载许可规则...</div>
+
+  const batch = selected ? currentBatch(data, selected.id) : undefined
+  const batchBlocking = Boolean(batch && batch.status !== 'released')
 
   const ruleColumns: TableColumnsType<LicenseRule> = [
     { title: '规则名称', dataIndex: 'name', minWidth: 240 },
@@ -139,6 +143,16 @@ export function LicensePage() {
                   : selected.status === 'licensed'
                     ? '已扣减额度'
                     : '尚未完成审批'}
+              </Descriptions.Item>
+              <Descriptions.Item label="对账批次">
+                {batch ? (
+                  <Space size={6}>
+                    <Tag color={batchStatusColors[batch.status]}>{batch.code}</Tag>
+                    <span>{batchStatusLabels[batch.status]}</span>
+                  </Space>
+                ) : (
+                  '送审后自动生成'
+                )}
               </Descriptions.Item>
             </Descriptions>
           ) : null}
@@ -236,6 +250,7 @@ export function LicensePage() {
                 disabled={
                   selected.status !== 'approved' ||
                   hasHighFindings ||
+                  batchBlocking ||
                   amount > remaining ||
                   remaining <= 0
                 }
@@ -246,6 +261,13 @@ export function LicensePage() {
               </Button>
               {selected.status !== 'approved' ? (
                 <Alert type="warning" showIcon message="只有全部审批步骤完成后才允许扣减额度。" />
+              ) : null}
+              {batchBlocking ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message={`对账批次 ${batch?.code} 仍在${batch ? batchStatusLabels[batch.status] : ''}，未放行前不能扣减额度。`}
+                />
               ) : null}
               {hasHighFindings ? (
                 <Alert type="error" showIcon message="存在高风险核对项，系统拒绝扣减额度。" />

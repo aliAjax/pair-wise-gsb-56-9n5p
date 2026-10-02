@@ -22,6 +22,7 @@ import {
 } from '@/app/api'
 import type { ApprovalStep, MaterialPackage } from '@/types/domain'
 import { approvalLevelLabels } from '@/services/rules'
+import { batchStatusColors, batchStatusLabels } from '@/services/recon'
 
 export function ApprovalPage() {
   const [searchParams] = useSearchParams()
@@ -44,6 +45,9 @@ export function ApprovalPage() {
   )
   const rule = data?.rules.find((item) => item.id === selected?.matchedRuleId)
   const activeStep = selected?.approvalRoute.find((step) => step.status === 'active')
+  const currentBatch = data?.batches
+    .filter((batch) => batch.packageId === selectedId)
+    .sort((left, right) => right.round - left.round)[0]
 
   if (isLoading || !data) return <div className="panel">正在加载审批路线...</div>
   const workspace = data
@@ -103,7 +107,9 @@ export function ApprovalPage() {
               ? '待审批'
               : value === 'returned'
                 ? '已退回'
-                : '未开始'}
+                : value === 'invalidated'
+                  ? '已失效'
+                  : '未开始'}
         </Tag>
       ),
     },
@@ -226,7 +232,9 @@ export function ApprovalPage() {
                           ? '已退回'
                           : step.status === 'active'
                             ? '待处理'
-                            : '等待前序步骤'
+                            : step.status === 'invalidated'
+                              ? '已失效（换版重算）'
+                              : '等待前序步骤'
                     }`,
                     status:
                       step.status === 'approved'
@@ -253,6 +261,18 @@ export function ApprovalPage() {
               <Tag>{selected.currentRound ? `第 ${selected.currentRound} 轮` : '未提交'}</Tag>
             </div>
             <Descriptions column={1} bordered size="small">
+              <Descriptions.Item label="对账批次">
+                {currentBatch ? (
+                  <Space size={6}>
+                    <Tag color={batchStatusColors[currentBatch.status]}>{currentBatch.code}</Tag>
+                    <span className="muted">
+                      {batchStatusLabels[currentBatch.status]} · revision {currentBatch.revision}
+                    </span>
+                  </Space>
+                ) : (
+                  '送审后自动生成'
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label="匹配规则">{rule?.name ?? '未匹配'}</Descriptions.Item>
               <Descriptions.Item label="规则等级">
                 {rule ? approvalLevelLabels[rule.approvalLevel] : '未知'}

@@ -48,7 +48,7 @@ export interface ApprovalStep {
   role: string
   assignee: string
   level: ApprovalLevel
-  status: 'waiting' | 'active' | 'approved' | 'returned'
+  status: 'waiting' | 'active' | 'approved' | 'returned' | 'invalidated'
   comment: string
   decidedAt?: string
 }
@@ -136,6 +136,72 @@ export interface AuditEntry {
   createdAt: string
 }
 
+export type BatchStatus = 'open' | 'ready' | 'released'
+export type ReceiptStatus = 'pending' | 'verified' | 'invalid'
+
+/** 逐页脱敏摘要：仅由页码与分类元数据派生，不含正文内容。 */
+export interface PageDigest {
+  pageId: string
+  page: number
+  digest: string
+  controlled: boolean
+  desensitized: boolean
+  reviewedAt: string
+}
+
+/** 送审时固化的单个文件引用版本及其逐页脱敏摘要。 */
+export interface BatchFileFreeze {
+  fileId: string
+  fileName: string
+  versionId: string
+  versionLabel: string
+  hash: string
+  pages: PageDigest[]
+  /** 无法补齐摘要的原因（未核对页、版本缺失等）。 */
+  missing: string[]
+  complete: boolean
+}
+
+/** 对账批次：把资料包版本、文件引用版本、审批路线和许可回执接成可续办的整体。 */
+export interface ReconBatch {
+  id: string
+  code: string
+  packageId: string
+  round: number
+  packageVersionId: string
+  routeSnapshot: {
+    stepId: string
+    order: number
+    role: string
+    assignee: string
+    level: ApprovalLevel
+  }[]
+  files: BatchFileFreeze[]
+  digestComplete: boolean
+  status: BatchStatus
+  /** 乐观锁版本号，双人同时确认时只放行一个。 */
+  revision: number
+  createdAt: string
+  createdBy: string
+  releasedAt?: string
+  releasedBy?: string
+}
+
+/** 许可平台回执：可能晚到或重复，按回执号去重，版本不符停在待核。 */
+export interface LicenseReceipt {
+  id: string
+  batchId: string
+  packageId: string
+  receiptNo: string
+  packageVersionId: string
+  fileVersions: Record<string, string>
+  status: ReceiptStatus
+  note: string
+  receivedAt: string
+  verifiedAt?: string
+  invalidReason?: string
+}
+
 export interface WorkspaceState {
   packages: MaterialPackage[]
   files: MaterialFile[]
@@ -143,6 +209,8 @@ export interface WorkspaceState {
   findings: ValidationFinding[]
   comments: ReviewComment[]
   audit: AuditEntry[]
+  batches: ReconBatch[]
+  receipts: LicenseReceipt[]
 }
 
 export interface VersionDiff {

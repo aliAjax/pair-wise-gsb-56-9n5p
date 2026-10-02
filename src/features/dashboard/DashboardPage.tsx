@@ -6,6 +6,7 @@ import { StatusTag } from '@/components/StatusTag'
 import { useGetWorkspaceQuery } from '@/app/api'
 import type { MaterialPackage, ValidationFinding } from '@/types/domain'
 import { categoryLabels } from '@/services/mockData'
+import { batchStatusColors, batchStatusLabels, currentBatch } from '@/services/recon'
 
 export function DashboardPage() {
   const navigate = useNavigate()
@@ -90,6 +91,20 @@ export function DashboardPage() {
       dataIndex: 'currentRound',
       width: 100,
       render: (value: number) => (value ? `第 ${value} 轮` : '未提交'),
+    },
+    {
+      title: '对账批次',
+      width: 190,
+      render: (_, record) => {
+        const batch = currentBatch(data, record.id)
+        if (!batch) return <span className="muted">未生成</span>
+        return (
+          <span>
+            <Tag color={batchStatusColors[batch.status]}>{batch.code}</Tag>
+            <span className="muted">{batchStatusLabels[batch.status]}</span>
+          </span>
+        )
+      },
     },
   ]
 

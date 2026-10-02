@@ -9,6 +9,7 @@ import {
 } from '@/app/api'
 import type { MaterialFile, VersionDiff } from '@/types/domain'
 import { diffPackageVersions } from '@/services/rules'
+import { batchStatusColors, batchStatusLabels } from '@/services/recon'
 
 export function VersionDiffPage() {
   const [searchParams] = useSearchParams()
@@ -36,6 +37,21 @@ export function VersionDiffPage() {
   if (isLoading || !data) return <div className="panel">正在加载版本数据...</div>
 
   const diffs = selected ? diffPackageVersions(selected, versionId, files) : []
+  const currentBatch = data.batches
+    .filter((batch) => batch.packageId === selectedId)
+    .sort((left, right) => right.round - left.round)[0]
+  const batchRows =
+    currentBatch?.files.map((frozen) => {
+      const file = files.find((item) => item.id === frozen.fileId)
+      const referenced = file?.versions.find((item) => item.id === file.referencedVersionId)
+      return {
+        fileId: frozen.fileId,
+        fileName: frozen.fileName,
+        frozenVersion: frozen.versionLabel,
+        referencedVersion: referenced?.label ?? '未设置',
+        aligned: file?.referencedVersionId === frozen.versionId,
+      }
+    }) ?? []
 
   const fileColumns: TableColumnsType<MaterialFile> = [
     { title: '文件名称', dataIndex: 'name', minWidth: 230 },
@@ -165,6 +181,52 @@ export function VersionDiffPage() {
             </Descriptions>
           </section>
         </div>
+      ) : null}
+
+      {currentBatch ? (
+        <section className="panel">
+          <div className="panel-title">
+            <h3>对账批次固化版本</h3>
+            <Space>
+              <Tag color={batchStatusColors[currentBatch.status]}>{currentBatch.code}</Tag>
+              <span className="muted">
+                {batchStatusLabels[currentBatch.status]} · 第 {currentBatch.round} 轮 · revision{' '}
+                {currentBatch.revision}
+              </span>
+            </Space>
+          </div>
+          <Table
+            rowKey="fileId"
+            dataSource={batchRows}
+            pagination={false}
+            size="small"
+            columns={[
+              { title: '文件', dataIndex: 'fileName', minWidth: 220 },
+              {
+                title: '批次固化版本',
+                dataIndex: 'frozenVersion',
+                width: 140,
+                render: (value: string) => <Tag color="blue">{value}</Tag>,
+              },
+              {
+                title: '当前引用版本',
+                dataIndex: 'referencedVersion',
+                width: 140,
+                render: (value: string) => <Tag>{value}</Tag>,
+              },
+              {
+                title: '一致性',
+                width: 110,
+                render: (_, record) =>
+                  record.aligned ? (
+                    <Tag color="success">一致</Tag>
+                  ) : (
+                    <Tag color="warning">已换版重算</Tag>
+                  ),
+              },
+            ]}
+          />
+        </section>
       ) : null}
 
       <section className="panel">

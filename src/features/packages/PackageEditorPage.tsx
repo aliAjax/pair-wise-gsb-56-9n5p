@@ -150,7 +150,7 @@ export function PackageEditorPage() {
       fileId: versionModalFile.id,
       ...values,
     }).unwrap()
-    message.success('新文件版本已建立，逐页分类需要重新完成')
+    message.success('新文件版本已建立；依赖旧版本的待审批步骤与未核回执已失效重算，逐页分类需重新完成')
     setVersionModalFile(undefined)
     versionForm.resetFields()
   }
